@@ -5,6 +5,7 @@
 The context aggregates all configuration files, environment variables, and command line arguments
 into one global stateful object to be used across all of conda.
 """
+
 from __future__ import annotations
 
 import logging
@@ -13,22 +14,24 @@ import platform
 import struct
 import sys
 from collections import defaultdict
-from contextlib import contextmanager
+from collections.abc import Mapping
+from contextlib import contextmanager, suppress
 from errno import ENOENT
-from functools import cached_property, lru_cache
+from functools import cache, cached_property
 from itertools import chain
 from os.path import abspath, exists, expanduser, isdir, isfile, join
 from os.path import split as path_split
-from typing import TYPE_CHECKING, Mapping
+from typing import TYPE_CHECKING
 
 from boltons.setutils import IndexedSet
+from frozendict import frozendict
 
 from .. import CONDA_SOURCE_ROOT
 from .. import __version__ as CONDA_VERSION
-from .._vendor.frozendict import frozendict
 from ..auxlib.decorators import memoizedproperty
 from ..auxlib.ish import dals
 from ..common._os.linux import linux_get_libc_version
+from ..common._os.osx import mac_ver
 from ..common.compat import NoneType, on_win
 from ..common.configuration import (
     Configuration,
@@ -43,7 +46,7 @@ from ..common.configuration import (
 )
 from ..common.constants import TRACE
 from ..common.iterators import unique
-from ..common.path import expand, paths_equal
+from ..common.path import BIN_DIRECTORY, expand, paths_equal
 from ..common.url import has_scheme, path_to_url, split_scheme_auth_token
 from ..deprecations import deprecated
 from .constants import (
@@ -53,7 +56,9 @@ from .constants import (
     DEFAULT_CHANNELS,
     DEFAULT_CHANNELS_UNIX,
     DEFAULT_CHANNELS_WIN,
+    DEFAULT_CONSOLE_REPORTER_BACKEND,
     DEFAULT_CUSTOM_CHANNELS,
+    DEFAULT_JSON_REPORTER_BACKEND,
     DEFAULT_SOLVER,
     DEFAULTS_CHANNEL_NAME,
     ERROR_UPLOAD_URL,
@@ -73,12 +78,12 @@ from .constants import (
 )
 
 if TYPE_CHECKING:
+    from collections.abc import Iterator
     from pathlib import Path
     from typing import Literal
 
     from ..common.configuration import Parameter, RawParameter
     from ..plugins.manager import CondaPluginManager
-
 
 try:
     os.getcwd()
@@ -119,7 +124,7 @@ user_rc_path = abspath(expanduser("~/.condarc"))
 sys_rc_path = join(sys.prefix, ".condarc")
 
 
-def user_data_dir(
+def user_data_dir(  # noqa: F811
     appname: str | None = None,
     appauthor: str | None | Literal[False] = None,
     version: str | None = None,
@@ -127,10 +132,8 @@ def user_data_dir(
 ):
     # Defer platformdirs import to reduce import time for conda activate.
     global user_data_dir
-    try:
-        from platformdirs import user_data_dir
-    except ImportError:  # pragma: no cover
-        from .._vendor.appdirs import user_data_dir
+    from platformdirs import user_data_dir
+
     return user_data_dir(appname, appauthor=appauthor, version=version, roaming=roaming)
 
 
@@ -152,7 +155,7 @@ def mockable_context_envs_dirs(root_writable, root_prefix, _envs_dirs):
 
 def channel_alias_validation(value):
     if value and not has_scheme(value):
-        return "channel_alias value '%s' must have scheme/protocol." % value
+        return f"channel_alias value '{value}' must have scheme/protocol."
     return True
 
 
@@ -174,7 +177,7 @@ def default_python_validation(value):
         # Set to None or '' meaning no python pinning
         return True
 
-    return "default_python value '%s' not of the form '[23].[0-9][0-9]?' or ''" % value
+    return f"default_python value '{value}' not of the form '[23].[0-9][0-9]?' or ''"
 
 
 def ssl_verify_validation(value):
@@ -183,12 +186,30 @@ def ssl_verify_validation(value):
             return "`ssl_verify: truststore` is only supported on Python 3.10 or later"
         elif value != "truststore" and not exists(value):
             return (
-                "ssl_verify value '%s' must be a boolean, a path to a "
+                f"ssl_verify value '{value}' must be a boolean, a path to a "
                 "certificate bundle file, a path to a directory containing "
                 "certificates of trusted CAs, or 'truststore' to use the "
-                "operating system certificate store." % value
+                "operating system certificate store."
             )
     return True
+
+
+def _warn_defaults_deprecation():
+    deprecated.topic(
+        "24.9",
+        "25.3",
+        topic=f"Adding '{DEFAULTS_CHANNEL_NAME}' to channel list implicitly",
+        addendum=(
+            "\n\n"
+            "To remove this warning, please choose a default channel explicitly "
+            "with conda's regular configuration system, e.g. "
+            f"by adding '{DEFAULTS_CHANNEL_NAME}' to the list of channels:\n\n"
+            f"  conda config --add channels {DEFAULTS_CHANNEL_NAME}"
+            "\n\n"
+            "For more information see https://docs.conda.io/projects/conda/en/stable/user-guide/configuration/use-condarc.html\n"
+        ),
+        deprecation_type=FutureWarning,
+    )
 
 
 class Context(Configuration):
@@ -262,7 +283,7 @@ class Context(Configuration):
         SequenceParameter(
             PrimitiveParameter("", element_type=str), string_delimiter="&"
         )
-    )  # TODO: consider a different string delimiter  # NOQA
+    )  # TODO: consider a different string delimiter
     disallowed_packages = ParameterLoader(
         SequenceParameter(
             PrimitiveParameter("", element_type=str), string_delimiter="&"
@@ -345,9 +366,7 @@ class Context(Configuration):
     )
     channel_priority = ParameterLoader(PrimitiveParameter(ChannelPriority.FLEXIBLE))
     _channels = ParameterLoader(
-        SequenceParameter(
-            PrimitiveParameter("", element_type=str), default=(DEFAULTS_CHANNEL_NAME,)
-        ),
+        SequenceParameter(PrimitiveParameter("", element_type=str), default=()),
         aliases=(
             "channels",
             "channel",
@@ -389,6 +408,10 @@ class Context(Configuration):
         aliases=("whitelist_channels",),
         expandvars=True,
     )
+    denylist_channels = ParameterLoader(
+        SequenceParameter(PrimitiveParameter("", element_type=str)),
+        expandvars=True,
+    )
     restore_free_channel = ParameterLoader(PrimitiveParameter(False))
     repodata_fns = ParameterLoader(
         SequenceParameter(
@@ -413,6 +436,10 @@ class Context(Configuration):
     error_upload_url = ParameterLoader(PrimitiveParameter(ERROR_UPLOAD_URL))
     force = ParameterLoader(PrimitiveParameter(False))
     json = ParameterLoader(PrimitiveParameter(False))
+    _console = ParameterLoader(
+        PrimitiveParameter(DEFAULT_CONSOLE_REPORTER_BACKEND, element_type=str),
+        aliases=["console"],
+    )
     offline = ParameterLoader(PrimitiveParameter(False))
     quiet = ParameterLoader(PrimitiveParameter(False))
     ignore_pinned = ParameterLoader(PrimitiveParameter(False))
@@ -431,6 +458,7 @@ class Context(Configuration):
     experimental = ParameterLoader(SequenceParameter(PrimitiveParameter("", str)))
     no_lock = ParameterLoader(PrimitiveParameter(False))
     repodata_use_zst = ParameterLoader(PrimitiveParameter(True))
+    envvars_force_uppercase = ParameterLoader(PrimitiveParameter(True))
 
     ####################################################
     #               Solver Configuration               #
@@ -498,8 +526,7 @@ class Context(Configuration):
                 "client_ssl_cert",
                 self.client_ssl_cert,
                 "<<merged>>",
-                "'client_ssl_cert' is required when 'client_ssl_cert_key' "
-                "is defined",
+                "'client_ssl_cert' is required when 'client_ssl_cert_key' is defined",
             )
             errors.append(error)
         if self.always_copy and self.always_softlink:
@@ -638,7 +665,7 @@ class Context(Configuration):
             return self._subdir
         return self._native_subdir()
 
-    @lru_cache(maxsize=None)
+    @cache
     def _native_subdir(self):
         m = platform.machine()
         if m in non_x86_machines:
@@ -662,17 +689,6 @@ class Context(Configuration):
             return 32
         else:
             return 8 * struct.calcsize("P")
-
-    @property
-    @deprecated(
-        "24.3",
-        "24.9",
-        addendum="Please use `conda.base.context.context.root_prefix` instead.",
-    )
-    def root_dir(self) -> os.PathLike:
-        # root_dir is an alias for root_prefix, we prefer the name "root_prefix"
-        # because it is more consistent with other names
-        return self.root_prefix
 
     @property
     def root_writable(self):
@@ -774,13 +790,12 @@ class Context(Configuration):
     @property
     @deprecated(
         "23.9",
-        "24.9",
+        "25.3",
         addendum="Please use `conda.base.context.context.conda_exe_vars_dict` instead",
     )
     def conda_exe(self):
-        bin_dir = "Scripts" if on_win else "bin"
         exe = "conda.exe" if on_win else "conda"
-        return join(self.conda_prefix, bin_dir, exe)
+        return join(self.conda_prefix, BIN_DIRECTORY, exe)
 
     @property
     def av_data_dir(self):
@@ -814,14 +829,11 @@ class Context(Configuration):
                 "CONDA_PYTHON_EXE": sys.executable,
             }
         else:
-            bin_dir = "Scripts" if on_win else "bin"
             exe = "conda.exe" if on_win else "conda"
-            # I was going to use None to indicate a variable to unset, but that gets tricky with
-            # error-on-undefined.
             return {
-                "CONDA_EXE": os.path.join(sys.prefix, bin_dir, exe),
-                "_CE_M": "",
-                "_CE_CONDA": "",
+                "CONDA_EXE": os.path.join(sys.prefix, BIN_DIRECTORY, exe),
+                "_CE_M": None,
+                "_CE_CONDA": None,
                 "CONDA_PYTHON_EXE": sys.executable,
             }
 
@@ -871,6 +883,15 @@ class Context(Configuration):
             default_channels = list(self._default_channels)
 
         if self.restore_free_channel:
+            deprecated.topic(
+                "24.9",
+                "25.3",
+                topic="Adding the 'free' channel as it existed prior to conda 4.7.",
+                addendum="See "
+                "https://docs.conda.io/projects/conda/en/stable/user-guide/configuration/free-channel.html "
+                "for more details.",
+                deprecation_type=FutureWarning,
+            )
             default_channels.insert(1, "https://repo.anaconda.com/pkgs/free")
 
         reserved_multichannel_urls = {
@@ -916,48 +937,49 @@ class Context(Configuration):
 
     @property
     def channels(self):
-        local_add = ("local",) if self.use_local else ()
-        if (
-            self._argparse_args
-            and "override_channels" in self._argparse_args
-            and self._argparse_args["override_channels"]
-        ):
+        local_channels = ("local",) if self.use_local else ()
+        argparse_args = dict(getattr(self, "_argparse_args", {}) or {})
+        # TODO: it's args.channel right now, not channels
+        cli_channels = argparse_args.get("channel") or ()
+
+        if argparse_args.get("override_channels"):
             if not self.override_channels_enabled:
                 from ..exceptions import OperationNotAllowed
 
                 raise OperationNotAllowed("Overriding channels has been disabled.")
-            elif not (
-                self._argparse_args
-                and "channel" in self._argparse_args
-                and self._argparse_args["channel"]
-            ):
+
+            if cli_channels:
+                return validate_channels((*local_channels, *cli_channels))
+            else:
                 from ..exceptions import ArgumentError
 
                 raise ArgumentError(
                     "At least one -c / --channel flag must be supplied when using "
                     "--override-channels."
                 )
-            else:
-                return tuple(IndexedSet((*local_add, *self._argparse_args["channel"])))
 
         # add 'defaults' channel when necessary if --channel is given via the command line
-        if self._argparse_args and "channel" in self._argparse_args:
-            # TODO: it's args.channel right now, not channels
-            argparse_channels = tuple(self._argparse_args["channel"] or ())
-            # Add condition to make sure that sure that we add the 'defaults'
+        if cli_channels:
+            # Add condition to make sure that we add the 'defaults'
             # channel only when no channels are defined in condarc
-            # We needs to get the config_files and then check that they
+            # We need to get the config_files and then check that they
             # don't define channels
             channel_in_config_files = any(
-                "channels" in context.raw_data[rc_file].keys()
-                for rc_file in self.config_files
+                "channels" in context.raw_data[rc_file] for rc_file in self.config_files
             )
-            if argparse_channels and not channel_in_config_files:
-                return tuple(
-                    IndexedSet((*local_add, *argparse_channels, DEFAULTS_CHANNEL_NAME))
+            if cli_channels and not channel_in_config_files:
+                _warn_defaults_deprecation()
+                return validate_channels(
+                    (*local_channels, *cli_channels, DEFAULTS_CHANNEL_NAME)
                 )
 
-        return tuple(IndexedSet((*local_add, *self._channels)))
+        if self._channels:
+            channels = self._channels
+        else:
+            _warn_defaults_deprecation()
+            channels = [DEFAULTS_CHANNEL_NAME]
+
+        return validate_channels((*local_channels, *channels))
 
     @property
     def config_files(self):
@@ -973,18 +995,9 @@ class Context(Configuration):
         #    is only called when use_only_tar_bz2 is first called.
         import conda_package_handling.api
 
-        use_only_tar_bz2 = False
-        if self._use_only_tar_bz2 is None:
-            if self._argparse_args and "use_only_tar_bz2" in self._argparse_args:
-                use_only_tar_bz2 &= self._argparse_args["use_only_tar_bz2"]
         return (
-            (
-                hasattr(conda_package_handling.api, "libarchive_enabled")
-                and not conda_package_handling.api.libarchive_enabled
-            )
-            or self._use_only_tar_bz2
-            or use_only_tar_bz2
-        )
+            not conda_package_handling.api.libarchive_enabled
+        ) or self._use_only_tar_bz2
 
     @property
     def binstar_upload(self):
@@ -1049,7 +1062,7 @@ class Context(Configuration):
             return logging.WARNING  # 30
 
     def solver_user_agent(self):
-        user_agent = "solver/%s" % self.solver
+        user_agent = f"solver/{self.solver}"
         try:
             solver_backend = self.plugin_manager.get_cached_solver_backend()
             # Solver.user_agent has to be a static or class method
@@ -1132,10 +1145,7 @@ class Context(Configuration):
         platform_name = self.platform_system_release[0]
         if platform_name == "Linux":
             try:
-                try:
-                    import distro
-                except ImportError:
-                    from .._vendor import distro
+                import distro
 
                 distinfo = distro.id(), distro.version(best=True)
             except Exception as e:
@@ -1144,9 +1154,9 @@ class Context(Configuration):
             distribution_name, distribution_version = distinfo[0], distinfo[1]
         elif platform_name == "Darwin":
             distribution_name = "OSX"
-            distribution_version = platform.mac_ver()[0]
+            distribution_version = mac_ver()
         else:
-            distribution_name = platform.system()
+            distribution_name = platform_name
             distribution_version = platform.version()
         return distribution_name, distribution_version
 
@@ -1158,11 +1168,10 @@ class Context(Configuration):
         return libc_family, libc_version
 
     @property
-    @deprecated("24.3", "24.9")
-    def cpu_flags(self):
-        # DANGER: This is rather slow
-        info = _get_cpu_info()
-        return info["flags"]
+    def console(self) -> str:
+        if self.json:
+            return DEFAULT_JSON_REPORTER_BACKEND
+        return self._console
 
     @property
     def category_map(self):
@@ -1170,9 +1179,11 @@ class Context(Configuration):
             "Channel Configuration": (
                 "channels",
                 "channel_alias",
+                "channel_settings",
                 "default_channels",
                 "override_channels_enabled",
                 "allowlist_channels",
+                "denylist_channels",
                 "custom_channels",
                 "custom_multichannels",
                 "migrated_channel_aliases",
@@ -1246,6 +1257,7 @@ class Context(Configuration):
                 "changeps1",
                 "env_prompt",
                 "json",
+                "console",
                 "notify_outdated_conda",
                 "quiet",
                 "report_errors",
@@ -1254,6 +1266,7 @@ class Context(Configuration):
                 "unsatisfiable_hints",
                 "unsatisfiable_hints_check_depth",
                 "number_channel_notices",
+                "envvars_force_uppercase",
             ),
             "CLI-only": (
                 "deps_modifier",
@@ -1271,7 +1284,6 @@ class Context(Configuration):
                 "allow_cycles",  # allow cyclical dependencies, or raise
                 "allow_conda_downgrades",
                 "add_pip_as_python_dependency",
-                "channel_settings",
                 "debug",
                 "trace",
                 "dev",
@@ -1284,10 +1296,10 @@ class Context(Configuration):
                 "solver_ignore_timestamps",
                 "subdir",
                 "subdirs",
-                # https://conda.io/docs/config.html#disable-updating-of-dependencies-update-dependencies # NOQA
-                # I don't think this documentation is correct any longer. # NOQA
+                # https://conda.io/docs/config.html#disable-updating-of-dependencies-update-dependencies
+                # I don't think this documentation is correct any longer.
                 "target_prefix_override",
-                # used to override prefix rewriting, for e.g. building docker containers or RPMs  # NOQA
+                # used to override prefix rewriting, for e.g. building docker containers or RPMs
                 "register_envs",
                 # whether to add the newly created prefix to ~/.conda/environments.txt
             ),
@@ -1443,7 +1455,7 @@ class Context(Configuration):
             #     set to 'warn' or 'prevent'.
             #     """
             # ),
-            # TODO: add shortened link to docs for conda_build at See https://conda.io/docs/user-guide/configuration/use-condarc.html#conda-build-configuration  # NOQA
+            # TODO: add shortened link to docs for conda_build at See https://conda.io/docs/user-guide/configuration/use-condarc.html#conda-build-configuration
             conda_build=dals(
                 """
                 General configuration parameters for conda-build.
@@ -1819,6 +1831,15 @@ class Context(Configuration):
                 channel exclusions will be enforced.
                 """
             ),
+            denylist_channels=dals(
+                """
+                The list of channels that are denied to be used on the system. Use of any
+                of these channels will result in an error. If conda-build channels are to be
+                allowed, along with the --use-local command line flag, be sure to not include
+                the 'local' channel in the list. If the list is empty or left undefined, no
+                channel exclusions will be enforced.
+                """
+            ),
             unsatisfiable_hints=dals(
                 """
                 A boolean to determine if conda should find conflicting packages in the case
@@ -1863,13 +1884,24 @@ class Context(Configuration):
                 Disable check for `repodata.json.zst`; use `repodata.json` only.
                 """
             ),
+            envvars_force_uppercase=dals(
+                """
+                Force uppercase for new environment variable names. Defaults to True.
+                """
+            ),
+            console=dals(
+                f"""
+                Configure different backends to be used while rendering normal console output.
+                Defaults to "{DEFAULT_CONSOLE_REPORTER_BACKEND}".
+                """
+            ),
         )
 
 
 def reset_context(search_path=SEARCH_PATH, argparse_args=None):
     global context
 
-    # reset plugin config params
+    # remove plugin config params
     remove_all_plugin_settings()
 
     context.__init__(search_path, argparse_args)
@@ -1877,7 +1909,18 @@ def reset_context(search_path=SEARCH_PATH, argparse_args=None):
     from ..models.channel import Channel
 
     Channel._reset_state()
+
     # need to import here to avoid circular dependency
+
+    # clear function cache
+    from ..reporters import _get_render_func
+
+    # reload plugin config params
+    with suppress(AttributeError):
+        del context.plugins
+
+    _get_render_func.cache_clear()
+
     return context
 
 
@@ -1977,15 +2020,6 @@ def replace_context_default(pushing=None, argparse_args=None):
 conda_tests_ctxt_mgmt_def_pol = replace_context_default
 
 
-@deprecated("24.3", "24.9")
-@lru_cache(maxsize=None)
-def _get_cpu_info():
-    # DANGER: This is rather slow
-    from .._vendor.cpuinfo import get_cpu_info
-
-    return frozendict(get_cpu_info())
-
-
 def env_name(prefix):
     # counter part to `locate_prefix_by_name()` below
     if not prefix:
@@ -2018,6 +2052,39 @@ def locate_prefix_by_name(name, envs_dirs=None):
     from ..exceptions import EnvironmentNameNotFound
 
     raise EnvironmentNameNotFound(name)
+
+
+def validate_channels(channels: Iterator[str]) -> tuple[str, ...]:
+    """
+    Validate if the given channel URLs are allowed based on the context's allowlist
+    and denylist configurations.
+
+    :param channels: A list of channels (either URLs or names) to validate.
+    :raises ChannelNotAllowed: If any URL is not in the allowlist.
+    :raises ChannelDenied: If any URL is in the denylist.
+    """
+    from ..exceptions import ChannelDenied, ChannelNotAllowed
+    from ..models.channel import Channel
+
+    allowlist = [
+        url
+        for channel in context.allowlist_channels
+        for url in Channel(channel).base_urls
+    ]
+    denylist = [
+        url
+        for channel in context.denylist_channels
+        for url in Channel(channel).base_urls
+    ]
+    if allowlist or denylist:
+        for channel in map(Channel, channels):
+            for url in channel.base_urls:
+                if url in denylist:
+                    raise ChannelDenied(channel)
+                if allowlist and url not in allowlist:
+                    raise ChannelNotAllowed(channel)
+
+    return tuple(IndexedSet(channels))
 
 
 def validate_prefix_name(prefix_name: str, ctx: Context, allow_base=True) -> str:
@@ -2108,7 +2175,7 @@ def _first_writable_envs_dir():
                 open(envs_dir_magic_file, "a").close()
                 return envs_dir
             except OSError:
-                log.trace("Tried envs_dir but not writable: %s", envs_dir)
+                log.log(TRACE, "Tried envs_dir but not writable: %s", envs_dir)
         else:
             from ..gateways.disk.create import create_envs_directory
 
