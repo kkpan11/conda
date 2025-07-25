@@ -614,6 +614,7 @@ class CondaSpecs:
     @_hookspec
     def conda_environment_specifiers(self) -> Iterable[CondaEnvironmentSpecifier]:
         """
+        **EXPERIMENTAL**
         Register new conda env spec type
 
         The example below defines a type of conda env file called "random". It
@@ -656,7 +657,7 @@ class CondaSpecs:
                         for spec_ext in RandomSpec.extensions
                     )
 
-                def environment(self):
+                def env(self):
                     return Environment(
                         name="".join(random.choice("0123456789abcdef") for i in range(6)),
                         dependencies=[random.choice(packages) for i in range(6)],
