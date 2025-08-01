@@ -2,6 +2,8 @@
 # SPDX-License-Identifier: BSD-3-Clause
 """Common utilities for conda command line tools."""
 
+from __future__ import annotations
+
 import re
 import sys
 from logging import getLogger
@@ -13,6 +15,7 @@ from os.path import (
     join,
     normcase,
 )
+from typing import TYPE_CHECKING
 
 from ..auxlib.ish import dals
 from ..base.constants import PREFIX_MAGIC_FILE
@@ -25,6 +28,7 @@ from ..exceptions import (
     CondaError,
     DirectoryNotACondaEnvironmentError,
     EnvironmentFileNotFound,
+    EnvironmentFileTypeMismatchError,
     EnvironmentLocationNotFound,
     EnvironmentNotWritableError,
     OperationNotAllowed,
@@ -33,6 +37,9 @@ from ..gateways.connection.session import CONDA_SESSION_SCHEMES
 from ..gateways.disk.test import file_path_is_writable
 from ..models.match_spec import MatchSpec
 from ..reporters import render
+
+if TYPE_CHECKING:
+    from collections.abc import Iterable
 
 log = getLogger(__name__)
 
@@ -116,7 +123,12 @@ def is_active_prefix(prefix: str) -> bool:
     )
 
 
-def arg2spec(arg, json=False, update=False):
+@deprecated(
+    "26.3",
+    "26.9",
+    addendum="Use `spec = str(MatchSpec(arg))` instead",
+)
+def arg2spec(arg: str, update: bool = False) -> str:
     try:
         spec = MatchSpec(arg)
     except:
@@ -137,8 +149,9 @@ def arg2spec(arg, json=False, update=False):
     return str(spec)
 
 
-def specs_from_args(args, json=False):
-    return [arg2spec(arg, json=json) for arg in args]
+@deprecated.argument("26.3", "26.9", "json")
+def specs_from_args(args: Iterable[str]) -> list[str]:
+    return [str(MatchSpec(arg)) for arg in args]
 
 
 spec_pat = re.compile(
@@ -359,6 +372,28 @@ def print_activate(env_name_or_prefix):  # pragma: no cover
             """
         )
         print(message)  # TODO: use logger
+
+
+def validate_environment_files_consistency(files: list[str]) -> None:
+    """Validates that all the provided environment files are of the same format type.
+
+    This function checks if all provided environment files are of the same format type
+    using the conda plugin system's environment specifiers. It prevents mixing different
+    environment file formats (e.g., YAML, explicit package lists, requirements.txt).
+
+    :raises EnvironmentFileTypeMismatchError: When files with different formats are found
+    """
+    if not files or len(files) <= 1:
+        return  # Nothing to validate if there are 0 or 1 files
+
+    # Get types for all files using the plugin manager
+    file_types = {
+        file: context.plugin_manager.get_environment_specifier(file).name
+        for file in files
+    }
+    # If there's more than one unique type, raise an error
+    if len(set(file_types.values())) > 1:
+        raise EnvironmentFileTypeMismatchError(file_types)
 
 
 def validate_file_exists(filename: str):
