@@ -109,7 +109,7 @@ jobs:
           key: cache-${{ env.HASH }}
 
       - name: Setup Miniconda
-        uses: conda-incubator/setup-miniconda@505e6394dae86d6a5c7fbb6e3fb8938e3e863830 # v3.1.1
+        uses: conda-incubator/setup-miniconda@835234971496cad1653abb28a638a281cf32541f # v3.2.0
         with:
           condarc-file: .github\condarc-${{ matrix.default-channel }}
           run-post: false  # skip post cleanup
@@ -245,7 +245,7 @@ jobs:
           key: cache-${{ env.HASH }}
 
       - name: Setup Miniconda
-        uses: conda-incubator/setup-miniconda@505e6394dae86d6a5c7fbb6e3fb8938e3e863830 # v3.1.1
+        uses: conda-incubator/setup-miniconda@835234971496cad1653abb28a638a281cf32541f # v3.2.0
         with:
           condarc-file: .github/condarc-${{ matrix.default-channel }}
           run-post: false  # skip post cleanup
@@ -337,7 +337,7 @@ jobs:
           key: cache-${{ env.HASH }}
 
       - name: Setup Miniconda
-        uses: conda-incubator/setup-miniconda@505e6394dae86d6a5c7fbb6e3fb8938e3e863830 # v3.1.1
+        uses: conda-incubator/setup-miniconda@835234971496cad1653abb28a638a281cf32541f # v3.2.0
         with:
           condarc-file: .github/condarc-defaults
           run-post: false  # skip post cleanup
@@ -365,7 +365,7 @@ jobs:
         run: conda list --show-channel-urls
 
       - name: Run Benchmarks
-        uses: CodSpeedHQ/action@0010eb0ca6e89b80c88e8edaaa07cfe5f3e6664d # v3.5.0
+        uses: CodSpeedHQ/action@0b6e7a3d96c9d2a6057e7bcea6b45aaf2f7ce60b # v3.8.0
         with:
           token: ${{ secrets.CODSPEED_TOKEN }}
           run: $CONDA/envs/test/bin/python -m pytest --codspeed
@@ -404,7 +404,7 @@ jobs:
           key: cache-${{ env.HASH }}
 
       - name: Setup Miniconda
-        uses: conda-incubator/setup-miniconda@505e6394dae86d6a5c7fbb6e3fb8938e3e863830 # v3.1.1
+        uses: conda-incubator/setup-miniconda@835234971496cad1653abb28a638a281cf32541f # v3.2.0
         with:
           condarc-file: .github/condarc-defaults
           run-post: false  # skip post cleanup
@@ -554,7 +554,7 @@ jobs:
           key: cache-${{ env.HASH }}
 
       - name: Setup Miniconda
-        uses: conda-incubator/setup-miniconda@505e6394dae86d6a5c7fbb6e3fb8938e3e863830 # v3.1.1
+        uses: conda-incubator/setup-miniconda@835234971496cad1653abb28a638a281cf32541f # v3.2.0
         with:
           condarc-file: .github/condarc-defaults
           run-post: false  # skip post cleanup
@@ -641,7 +641,7 @@ jobs:
           key: cache-${{ env.HASH }}
 
       - name: Setup Miniconda
-        uses: conda-incubator/setup-miniconda@505e6394dae86d6a5c7fbb6e3fb8938e3e863830 # v3.1.1
+        uses: conda-incubator/setup-miniconda@835234971496cad1653abb28a638a281cf32541f # v3.2.0
         with:
           condarc-file: .github/condarc-${{ matrix.default-channel }}
           run-post: false  # skip post cleanup

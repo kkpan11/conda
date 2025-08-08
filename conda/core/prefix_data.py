@@ -4,7 +4,6 @@
 
 from __future__ import annotations
 
-import json
 import os
 import re
 from logging import getLogger
@@ -18,6 +17,7 @@ from ..base.constants import (
     PREFIX_FROZEN_FILE,
     PREFIX_MAGIC_FILE,
     PREFIX_NAME_DISALLOWED_CHARS,
+    PREFIX_PINNED_FILE,
     PREFIX_STATE_FILE,
     ROOT_ENV_NAME,
 )
@@ -25,17 +25,15 @@ from ..base.context import context, locate_prefix_by_name
 from ..common.compat import on_win
 from ..common.constants import NULL
 from ..common.io import time_recorder
-from ..common.path import (
-    expand,
-    paths_equal,
-)
-from ..common.serialize import json_load
+from ..common.path import expand, paths_equal
+from ..common.serialize import json
 from ..common.url import mask_anaconda_token
 from ..common.url import remove_auth as url_remove_auth
 from ..deprecations import deprecated
 from ..exceptions import (
     BasicClobberError,
     CondaDependencyError,
+    CondaError,
     CondaValueError,
     CorruptedEnvironmentError,
     DirectoryNotACondaEnvironmentError,
@@ -48,6 +46,7 @@ from ..exceptions import (
 from ..gateways.disk.create import first_writable_envs_dir, write_as_json_to_file
 from ..gateways.disk.delete import rm_rf
 from ..gateways.disk.test import file_path_is_writable
+from ..models.enums import PackageType
 from ..models.match_spec import MatchSpec
 from ..models.prefix_graph import PrefixGraph
 from ..models.records import PackageRecord, PrefixRecord
@@ -114,7 +113,7 @@ class PrefixData(metaclass=PrefixDataType):
     )
     def __init__(
         self,
-        prefix_path: str | os.PathLike[str] | Path,
+        prefix_path: PathType,
         interoperability: bool | None = None,
     ):
         # pip_interop_enabled is a temporary parameter; DO NOT USE
@@ -391,11 +390,11 @@ class PrefixData(metaclass=PrefixDataType):
         return fn + ".json"
 
     def insert(self, prefix_record: PrefixRecord, remove_auth: bool = True) -> None:
-        assert prefix_record.name not in self._prefix_records, (
-            f"Prefix record insertion error: a record with name {prefix_record.name} already exists "
-            "in the prefix. This is a bug in conda. Please report it at "
-            "https://github.com/conda/conda/issues"
-        )
+        if prefix_record.name in self._prefix_records:
+            raise CondaError(
+                f"Prefix record '{prefix_record.name}' already exists. "
+                f"Try `conda clean --all` to fix."
+            )
 
         prefix_record_json_path = (
             self.prefix_path / "conda-meta" / self._get_json_fn(prefix_record)
@@ -478,6 +477,36 @@ class PrefixData(metaclass=PrefixDataType):
                 prefix_rec for prefix_rec in self.iter_records() if prefix_rec == param
             )
 
+    def get_conda_packages(self) -> list[PrefixRecord]:
+        """Get conda packages sorted alphabetically by name.
+
+        :return: Sorted conda package records
+        """
+        conda_types = {None, PackageType.NOARCH_GENERIC, PackageType.NOARCH_PYTHON}
+        conda_packages = [
+            record
+            for record in self.iter_records()
+            if record.package_type in conda_types
+        ]
+        return sorted(conda_packages, key=lambda x: x.name)
+
+    def get_python_packages(self) -> list[PrefixRecord]:
+        """Get Python packages (installed via pip) sorted alphabetically by name.
+
+        :return: Sorted Python package records
+        """
+        python_types = {
+            PackageType.VIRTUAL_PYTHON_WHEEL,
+            PackageType.VIRTUAL_PYTHON_EGG_MANAGEABLE,
+            PackageType.VIRTUAL_PYTHON_EGG_UNMANAGEABLE,
+        }
+        python_packages = [
+            record
+            for record in self.iter_records()
+            if record.package_type in python_types
+        ]
+        return sorted(python_packages, key=lambda x: x.name)
+
     @property
     def _prefix_records(self) -> dict[str, PrefixRecord] | None:
         return self.__prefix_records or self.load() or self.__prefix_records
@@ -486,10 +515,10 @@ class PrefixData(metaclass=PrefixDataType):
         log.debug("loading prefix record %s", prefix_record_json_path)
         with open(prefix_record_json_path) as fh:
             try:
-                json_data = json_load(fh.read())
+                json_data = json.load(fh)
             except (UnicodeDecodeError, json.JSONDecodeError):
                 # UnicodeDecodeError: catch horribly corrupt files
-                # JSONDecodeError: catch bad json format files
+                # json.JSONDecodeError: catch bad json format files
                 raise CorruptedEnvironmentError(
                     self.prefix_path, prefix_record_json_path
                 )
@@ -557,9 +586,7 @@ class PrefixData(metaclass=PrefixDataType):
 
     def _write_environment_state_file(self, state: dict[str, dict[str, str]]) -> None:
         env_vars_file = self.prefix_path / PREFIX_STATE_FILE
-        env_vars_file.write_text(
-            json.dumps(state, ensure_ascii=False, default=lambda x: x.__dict__)
-        )
+        env_vars_file.write_text(json.dumps(state, ensure_ascii=False))
 
     def get_environment_env_vars(self) -> dict[str, str] | dict[bytes, bytes]:
         prefix_state = self._get_environment_state_file()
@@ -598,6 +625,21 @@ class PrefixData(metaclass=PrefixDataType):
         if on_win and Path(context.root_prefix, ".nonadmin").is_file():
             self.prefix_path.mkdir(parents=True, exist_ok=True)
             (self.prefix_path / ".nonadmin").touch()
+
+    def get_pinned_specs(self) -> tuple[MatchSpec]:
+        """Find pinned specs from file and return a tuple of MatchSpec."""
+        pin_file = self.prefix_path / PREFIX_PINNED_FILE
+        if pin_file.exists():
+            with pin_file.open() as f:
+                from_file = (
+                    i
+                    for i in f.read().strip().splitlines()
+                    if i and not i.strip().startswith("#")
+                )
+        else:
+            from_file = ()
+
+        return tuple(MatchSpec(spec, optional=True) for spec in from_file)
 
     # endregion
 
@@ -660,12 +702,13 @@ def get_python_version_for_prefix(prefix: os.PathLike) -> str | None:
     in that prefix.
     """
     # returns a string e.g. "2.7", "3.4", "3.5" or None
-    record = python_record_for_prefix(prefix)
+    record = PrefixData(prefix).get("python", None)
     if record is not None:
         if record.version[3].isdigit():
             return record.version[:4]
         else:
             return record.version[:3]
+    return None
 
 
 def delete_prefix_from_linked_data(path: str | os.PathLike | Path) -> bool:

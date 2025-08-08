@@ -46,6 +46,7 @@ from ..common.url import has_scheme, path_to_url, split_scheme_auth_token
 from ..deprecations import deprecated
 from .constants import (
     APP_NAME,
+    CMD_LINE_SOURCE,
     CONDA_LIST_FIELDS,
     DEFAULT_AGGRESSIVE_UPDATE_PACKAGES,
     DEFAULT_CHANNEL_ALIAS,
@@ -58,6 +59,7 @@ from .constants import (
     DEFAULT_JSON_REPORTER_BACKEND,
     DEFAULT_SOLVER,
     DEFAULTS_CHANNEL_NAME,
+    ENV_VARS_SOURCE,
     ERROR_UPLOAD_URL,
     KNOWN_SUBDIRS,
     NO_PLUGINS,
@@ -245,6 +247,12 @@ class Context(Configuration):
     clobber = ParameterLoader(PrimitiveParameter(False))
     changeps1 = ParameterLoader(PrimitiveParameter(True))
     env_prompt = ParameterLoader(PrimitiveParameter("({default_env}) "))
+
+    # environment_specifier is an EXPERIMENTAL config parameter
+    environment_specifier = ParameterLoader(
+        PrimitiveParameter(None, element_type=(str, NoneType)), aliases=("env_spec",)
+    )
+
     create_default_packages = ParameterLoader(
         SequenceParameter(PrimitiveParameter("", element_type=str))
     )
@@ -859,23 +867,33 @@ class Context(Configuration):
         None means unset it.
         """
         if context.dev:
+            if pythonpath := os.environ.get("PYTHONPATH", ""):
+                pythonpath = os.pathsep.join((CONDA_SOURCE_ROOT, pythonpath))
+            else:
+                pythonpath = CONDA_SOURCE_ROOT
             return {
                 "CONDA_EXE": sys.executable,
+                "_CONDA_EXE": sys.executable,
                 # do not confuse with os.path.join, we are joining paths with ; or : delimiters
-                "PYTHONPATH": os.pathsep.join(
-                    (CONDA_SOURCE_ROOT, os.environ.get("PYTHONPATH", ""))
-                ),
+                "PYTHONPATH": pythonpath,
                 "_CE_M": "-m",
                 "_CE_CONDA": "conda",
                 "CONDA_PYTHON_EXE": sys.executable,
+                "_CONDA_ROOT": self.conda_prefix,
             }
         else:
-            exe = "conda.exe" if on_win else "conda"
+            exe = os.path.join(
+                self.conda_prefix,
+                BIN_DIRECTORY,
+                "conda.exe" if on_win else "conda",
+            )
             return {
-                "CONDA_EXE": os.path.join(sys.prefix, BIN_DIRECTORY, exe),
+                "CONDA_EXE": exe,
+                "_CONDA_EXE": exe,
                 "_CE_M": None,
                 "_CE_CONDA": None,
                 "CONDA_PYTHON_EXE": sys.executable,
+                "_CONDA_ROOT": self.conda_prefix,
             }
 
     @memoizedproperty
@@ -1038,7 +1056,7 @@ class Context(Configuration):
         return tuple(
             path
             for path in context.collect_all()
-            if path not in ("envvars", "cmd_line")
+            if path not in (ENV_VARS_SOURCE, CMD_LINE_SOURCE)
         )
 
     @property
@@ -1239,6 +1257,31 @@ class Context(Configuration):
         return self._default_activation_env or ROOT_ENV_NAME
 
     @property
+    def environment_context_keys(self) -> list[str]:
+        return [
+            "aggressive_update_packages",
+            "channel_priority",
+            "channels",
+            "channel_settings",
+            "custom_channels",
+            "custom_multichannels",
+            "deps_modifier",
+            "disallowed_packages",
+            "pinned_packages",
+            "repodata_fns",
+            "sat_solver",
+            "solver",
+            "track_features",
+            "update_modifier",
+            "use_only_tar_bz2",
+        ]
+
+    @property
+    def environment_settings(self) -> dict[str, Any]:
+        """Returns a dict of environment related settings"""
+        return {key: getattr(self, key) for key in self.environment_context_keys}
+
+    @property
     def category_map(self) -> dict[str, tuple[str, ...]]:
         return {
             "Channel Configuration": (
@@ -1373,6 +1416,7 @@ class Context(Configuration):
                 # prevent modifications to envs marked with conda-meta/frozen
             ),
             "Plugin Configuration": ("no_plugins",),
+            "Experimental": ("environment_specifier",),
         }
 
     def get_descriptions(self) -> dict[str, str]:
@@ -1624,6 +1668,14 @@ class Context(Configuration):
                 of '{name}' if the active environment is a conda named environment ('-n'
                 flag), or otherwise holds the value of '{prefix}'. Templating uses python's
                 str.format() method.
+                """
+            ),
+            environment_specifier=dals(
+                """
+                **EXPERIMENTAL** While experimental, expect both major and minor changes across minor releases.
+
+                The name of the environment specifier plugin that should be used for this context.
+                If not specified, the plugin manager will try to detect the plugin to use.
                 """
             ),
             execute_threads=dals(

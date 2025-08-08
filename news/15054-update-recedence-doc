@@ -1,6 +1,6 @@
 ### Enhancements
 
-* Add "environment consistency" health check to `conda doctor`. (#14715 via #14799)
+* <news item>
 
 ### Bug fixes
 
@@ -12,7 +12,7 @@
 
 ### Docs
 
-* <news item>
+* Update docs to reflect that conda cli args are higher precedence than env vars. (#15054)
 
 ### Other
 

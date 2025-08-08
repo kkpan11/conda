@@ -4,9 +4,9 @@
 
 from __future__ import annotations
 
-import json
 import os
 import sys
+from collections import defaultdict
 from datetime import timedelta
 from logging import getLogger
 from os.path import join
@@ -14,16 +14,20 @@ from textwrap import dedent, indent
 from traceback import format_exception, format_exception_only
 from typing import TYPE_CHECKING
 
-from requests.exceptions import JSONDecodeError
-
 from . import CondaError, CondaExitZero, CondaMultiError
-from .auxlib.entity import EntityEncoder
 from .auxlib.ish import dals
 from .auxlib.logz import stringify
-from .base.constants import COMPATIBLE_SHELLS, PathConflict, SafetyChecks
+from .base.constants import (
+    COMPATIBLE_SHELLS,
+    PREFIX_PINNED_FILE,
+    PathConflict,
+    SafetyChecks,
+)
 from .common.compat import on_win
 from .common.io import dashlist
 from .common.iterators import groupby_to_dict as groupby
+from .common.serialize.json import JSONDecodeError
+from .common.serialize.json import dumps as json_dumps
 from .common.signals import get_signal_name
 from .common.url import join_url, maybe_unquote
 from .deprecations import DeprecatedError  # noqa: F401
@@ -40,6 +44,7 @@ if TYPE_CHECKING:
     from conda.base.context import Context
     from conda.models.match_spec import MatchSpec
     from conda.models.records import PackageRecord
+    from conda.plugins.types import CondaEnvironmentExporter
 
 log = getLogger(__name__)
 
@@ -473,15 +478,16 @@ class CondaOSError(CondaError, OSError):
 
 
 class ProxyError(CondaError):
-    def __init__(self):
-        message = dals(
-            """
-        Conda cannot proceed due to an error in your proxy configuration.
-        Check for typos and other configuration errors in any '.netrc' file in your home directory,
-        any environment variables ending in '_PROXY', and any other system-wide proxy
-        configuration settings.
-        """
-        )
+    def __init__(self, message: str | None = None):
+        if message is None:
+            message = dals(
+                """
+                Conda cannot proceed due to an error in your proxy configuration.
+                Check for typos and other configuration errors in any '.netrc' file in your home directory,
+                any environment variables ending in '_PROXY', and any other system-wide proxy
+                configuration settings.
+                """
+            )
         super().__init__(message)
 
 
@@ -564,10 +570,9 @@ class UnavailableInvalidChannel(ChannelError):
             url = join_url(channel.location, channel.name)
             message += dedent(
                 f"""
-                As of conda 4.3, a valid channel must contain a `noarch/repodata.json` and
-                associated `noarch/repodata.json.bz2` file, even if `noarch/repodata.json` is
+                As of conda 4.3, a valid channel must contain a
+                `noarch/repodata.json` even if `noarch/repodata.json` is
                 empty. Use `conda index {url}`, or create `noarch/repodata.json`
-                and associated `noarch/repodata.json.bz2`.
                 """
             )
 
@@ -980,7 +985,7 @@ class SpecsConfigurationConflictError(CondaError):
         ).format(
             requested_specs_formatted=dashlist(requested_specs, 4),
             pinned_specs_formatted=dashlist(pinned_specs, 4),
-            pinned_specs_path=join(prefix, "conda-meta", "pinned"),
+            pinned_specs_path=join(prefix, PREFIX_PINNED_FILE),
         )
         super().__init__(
             message,
@@ -1257,10 +1262,24 @@ class EnvironmentFileExtensionNotValid(CondaEnvException):
         super().__init__(msg, *args, **kwargs)
 
 
+class EnvironmentFileTypeMismatchError(CondaError):
+    def __init__(self, file_types: dict[str, str], *args, **kwargs):
+        type_groups = defaultdict(list)
+        for file, file_type in file_types.items():
+            type_groups[file_type].append(file)
+
+        lines = ["Cannot mix environment file formats.\n"]
+
+        for file_type, files in type_groups.items():
+            lines.extend(f"'{file}' is a {file_type} format file" for file in files)
+
+        super().__init__("\n".join(lines), *args, **kwargs)
+
+
 class EnvironmentFileEmpty(CondaEnvException):
     def __init__(self, filename: os.PathLike, *args, **kwargs):
         self.filename = filename
-        msg = f"'{filename}' is empty"
+        msg = f"Environment file '{filename}' is empty."
         super().__init__(msg, *args, **kwargs)
 
 
@@ -1272,18 +1291,8 @@ class EnvironmentFileNotDownloaded(CondaError):
         super().__init__(msg, *args, **kwargs)
 
 
-class EnvironmentSpecPluginNotDetected(CondaError):
-    def __init__(self, name, plugin_names, *args, **kwargs):
-        self.name = name
-        msg = dals(
-            f"""
-            Environment at {name} is not readable by any installed
-            environment specifier plugins.
-
-            Available plugins: {dashlist(plugin_names, 4)}
-            """
-        )
-        super().__init__(msg, *args, **kwargs)
+class PluginError(CondaError):
+    pass
 
 
 class SpecNotFound(CondaError):
@@ -1291,8 +1300,72 @@ class SpecNotFound(CondaError):
         super().__init__(msg, *args, **kwargs)
 
 
-class PluginError(CondaError):
-    pass
+class EnvironmentSpecPluginNotDetected(SpecNotFound):
+    def __init__(
+        self,
+        name: str,
+        plugin_names: Iterable[str],
+        autodetect_disabled_plugins: Iterable[str] = (),
+        *args,
+        **kwargs,
+    ):
+        self.name = name
+        msg = dals(
+            f"""
+            Environment at {name} is not readable by any installed environment specifier plugins.
+
+            Available plugins: {dashlist(plugin_names, 16)}
+
+            """
+        )
+        if autodetect_disabled_plugins:
+            msg += dals(
+                """
+                Found compatible plugins but they must be explicitly selected.
+                Request conda to use these plugins by providing
+                the cli argument `--environment-spec PLUGIN_NAME`:
+                """
+            ) + dashlist(autodetect_disabled_plugins, 4)
+        super().__init__(msg, *args, **kwargs)
+
+
+class EnvironmentExporterNotDetected(CondaError):
+    def __init__(
+        self,
+        filename: str,
+        exporters: Iterable[CondaEnvironmentExporter],
+        *args,
+        **kwargs,
+    ):
+        self.filename = filename
+        supported_filenames: list[str] = []
+        available_formats: list[str] = []
+        for exporter in exporters:
+            supported_filenames.extend(
+                f"{filename:<20} (format: {exporter.name})"
+                for filename in exporter.default_filenames
+            )
+            available_formats.append(
+                f"{exporter.name:<20} (aliases: {', '.join(exporter.aliases)})"
+                if exporter.aliases
+                else exporter.name
+            )
+        msg = (
+            f"No environment exporter plugin found for filename '{filename}'.\n"
+            f"\n"
+            f"Supported filenames:{dashlist(supported_filenames)}\n"
+            f"\n"
+            f"Available formats:{dashlist(available_formats)}\n"
+            f"\n"
+            f"Use conda export --format=FORMAT to specify the export format explicitly, "
+            f"or rename your file to match a supported filename pattern."
+        )
+        super().__init__(msg, *args, **kwargs)
+
+
+class SpecNotFoundInPackageCache(CondaError):
+    def __init__(self, msg: str, *args, **kwargs):
+        super().__init__(msg, *args, **kwargs)
 
 
 def maybe_raise(error: BaseException, context: Context):
@@ -1346,9 +1419,7 @@ def print_conda_exception(exc_val: CondaError, exc_tb: TracebackType | None = No
         if isinstance(exc_val, DryRunExit):
             return
         logger = getLogger("conda.stdout" if rc else "conda.stderr")
-        exc_json = json.dumps(
-            exc_val.dump_map(), indent=2, sort_keys=True, cls=EntityEncoder
-        )
+        exc_json = json_dumps(exc_val.dump_map(), sort_keys=True)
         logger.info(f"{exc_json}\n")
     else:
         stderrlog = getLogger("conda.stderr")
